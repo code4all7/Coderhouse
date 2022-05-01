@@ -1,17 +1,30 @@
 require('dotenv').config()
 const express = require('express')
 const app = express()
+const http = require('http')
 const router = require('./routes')
 const DbConnect = require('./database')
 const cors = require('cors')
 const cookieParser = require('cookie-parser')
+const ACTIONS = require('./actions')
+const { Server } = require('socket.io')
 
-app.use(cookieParser())
+const server = http.createServer(app)
+
 const corsOption = {
   credentials: true,
   origin: ['http://localhost:3000'],
 }
 app.use(cors(corsOption))
+
+const io = new Server(server, {
+  cors: {
+    origin: 'http://localhost:3000',
+    methods: ['GET', 'POST'],
+  },
+})
+
+app.use(cookieParser())
 app.use('/storage', express.static('storage'))
 
 const PORT = process.env.PORT || 5500
@@ -24,6 +37,78 @@ app.get('/', (req, res) => {
   res.send('Hello from server')
 })
 
-app.listen(PORT, () => {
+// Sockets
+
+const socketUserMapping = {}
+
+io.on('connection', (socket) => {
+  console.log(`new connection ${socket.id}`)
+
+  socket.on(ACTIONS.JOIN, ({ roomId, user }) => {
+    socketUserMapping[socket.id] = user
+    const clients = Array.from(io.sockets.adapter.rooms.get(roomId) || [])
+
+    clients.forEach((clientId) => {
+      io.to(clientId).emit(ACTIONS.ADD_PEER, {
+        peerId: socket.id,
+        createOffer: false,
+        user,
+      })
+
+      socket.emit(ACTIONS.ADD_PEER, {
+        peerId: clientId,
+        createOffer: true,
+        user: socketUserMapping[clientId],
+      })
+    })
+
+    socket.join(roomId)
+  })
+
+  // handle relay ice
+  socket.on(ACTIONS.RELAY_ICE, ({ peerId, icecandidate }) => {
+    io.to(peerId).emit(ACTIONS.ICE_CANDIDATE, {
+      peerId: socket.id,
+      icecandidate,
+    })
+  })
+
+  // handle relay sdp (session description)
+  socket.on(ACTIONS.RELAY_SDP, ({ peerId, sessionDescription }) => {
+    io.to(peerId).emit(ACTIONS.SESSION_DESCRIPTION, {
+      peerId: socket.id,
+      sessionDescription,
+    })
+  })
+
+  // Leaving the room
+
+  const leaveRoom = ({ roomId }) => {
+    const { rooms } = socket
+
+    Array.from(rooms).forEach((roomId) => {
+      const clients = Array.from(io.sockets.adapter.rooms.get(roomId) || [])
+
+      clients.forEach((clientId) => {
+        io.to(clientId).emit(ACTIONS.REMOVE_PEER, {
+          peerId: socket.id,
+          userId: socketUserMapping[socket.id]?._id,
+        })
+
+        socket.emit(ACTIONS.REMOVE_PEER, {
+          peerId: clientId,
+          userId: socketUserMapping[clientId]?._id,
+        })
+      })
+      socket.leave(roomId)
+    })
+    delete socketUserMapping[socket.id]
+  }
+
+  socket.on(ACTIONS.LEAVE, leaveRoom)
+  socket.on('disconnecting', leaveRoom)
+})
+
+server.listen(PORT, () => {
   console.log(`App is runnig on ${PORT}`)
 })
